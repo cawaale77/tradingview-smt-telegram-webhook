@@ -1,0 +1,229 @@
+//@version=5
+indicator("SMT Divergence Alerts - Forex & Gold", "SMT Alerts", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// This indicator is an alert/reminder tool only. It does not place trades.
+
+// -----------------------------
+// Inputs
+// -----------------------------
+forexGroup = "Forex SMT Symbols"
+eurSymbol = input.symbol("OANDA:EURUSD", "EURUSD", group=forexGroup)
+gbpSymbol = input.symbol("OANDA:GBPUSD", "GBPUSD", group=forexGroup)
+chfSymbol = input.symbol("OANDA:USDCHF", "USDCHF", group=forexGroup)
+
+goldGroup = "Gold SMT Symbols"
+xauUsdSymbol = input.symbol("OANDA:XAUUSD", "XAUUSD", group=goldGroup)
+xauEurSymbol = input.symbol("OANDA:XAUEUR", "XAUEUR", group=goldGroup)
+xauGbpSymbol = input.symbol("OANDA:XAUGBP", "XAUGBP", group=goldGroup)
+
+settingsGroup = "SMT Settings"
+pivotLen = input.int(3, "Pivot length", minval=1, maxval=20, group=settingsGroup)
+sessionInput = input.session("0700-1700", "Session filter", group=settingsGroup)
+sessionTimezone = input.string("Etc/UTC", "Session timezone", group=settingsGroup, tooltip="Use an IANA timezone such as Etc/UTC, Europe/London, America/New_York, or Africa/Nairobi.")
+secretInput = input.string("CHANGE_ME", "Webhook secret", group=settingsGroup)
+showForexSignals = input.bool(true, "Show Forex SMT", group=settingsGroup)
+showGoldSignals = input.bool(true, "Show Gold SMT", group=settingsGroup)
+
+visualGroup = "Visuals"
+bullColor = input.color(color.new(color.lime, 0), "Bullish SMT color", group=visualGroup)
+bearColor = input.color(color.new(color.red, 0), "Bearish SMT color", group=visualGroup)
+lineWidth = input.int(2, "SMT line width", minval=1, maxval=5, group=visualGroup)
+keepLastObjects = input.int(120, "Keep last drawings", minval=20, maxval=450, group=visualGroup)
+drawForeignSignals = input.bool(false, "Draw non-chart symbol signals", group=visualGroup, tooltip="Alerts always fire for all configured symbols. Leave this off to avoid distorting chart scale with lines from instruments in a different price range.")
+
+// -----------------------------
+// Helpers
+// -----------------------------
+inSession = not na(time(timeframe.period, sessionInput, sessionTimezone))
+inSessionAtPivot = inSession[pivotLen]
+tfText = timeframe.period
+
+f_shortSymbol(string symbolId) =>
+    string[] parts = str.split(symbolId, ":")
+    array.size(parts) > 1 ? array.get(parts, 1) : symbolId
+
+f_jsonEscape(string value) =>
+    string escaped = str.replace_all(value, "\\", "\\\\")
+    escaped := str.replace_all(escaped, "\"", "\\\"")
+    escaped := str.replace_all(escaped, "\n", "\\n")
+    escaped
+
+f_message(string signalType, string groupName, string mainName, string comparisonName, string direction, string meaning) =>
+    "🚨 " + signalType + " DETECTED\n" +
+      "Group: " + groupName + "\n" +
+      "Main: " + mainName + "\n" +
+      "Comparison: " + comparisonName + "\n" +
+      "Timeframe: " + tfText + "\n" +
+      "Direction: " + direction + "\n" +
+      "Meaning: " + meaning + "\n" +
+      "Action: Wait for entry model confirmation."
+
+f_alertJson(string signalType, string groupName, string mainName, string comparisonName, float priceValue, int timestampValue, string messageText) =>
+    "{" +
+      "\"secret\":\"" + f_jsonEscape(secretInput) + "\"," +
+      "\"signal_type\":\"" + signalType + "\"," +
+      "\"group\":\"" + groupName + "\"," +
+      "\"main_symbol\":\"" + f_jsonEscape(mainName) + "\"," +
+      "\"comparison_symbol\":\"" + f_jsonEscape(comparisonName) + "\"," +
+      "\"timeframe\":\"" + tfText + "\"," +
+      "\"price\":\"" + str.tostring(priceValue, format.mintick) + "\"," +
+      "\"timestamp\":\"" + str.tostring(timestampValue) + "\"," +
+      "\"message\":\"" + f_jsonEscape(messageText) + "\"" +
+      "}"
+
+var line[] smtLines = array.new_line()
+var label[] smtLabels = array.new_label()
+
+f_storeDrawing(line smtLine, label smtLabel) =>
+    array.push(smtLines, smtLine)
+    array.push(smtLabels, smtLabel)
+    if array.size(smtLines) > keepLastObjects
+        line oldLine = array.shift(smtLines)
+        label oldLabel = array.shift(smtLabels)
+        line.delete(oldLine)
+        label.delete(oldLabel)
+
+f_drawSignal(bool bullish, string signalType, string mainName, string comparisonName, int previousPivotBar, float previousPivot, int currentPivotBar, float currentPivot) =>
+    color signalColor = bullish ? bullColor : bearColor
+    line smtLine = line.new(previousPivotBar, previousPivot, currentPivotBar, currentPivot, xloc=xloc.bar_index, extend=extend.none, color=signalColor, width=lineWidth)
+    string labelText = signalType + "\n" + mainName + " vs " + comparisonName + "\n" + tfText + "\n" + (bullish ? "Direction: Bullish" : "Direction: Bearish")
+    label smtLabel = label.new(currentPivotBar, currentPivot, labelText, xloc=xloc.bar_index, yloc=bullish ? yloc.belowbar : yloc.abovebar, style=bullish ? label.style_label_up : label.style_label_down, color=color.new(signalColor, 8), textcolor=color.white, size=size.small)
+    f_storeDrawing(smtLine, smtLabel)
+
+f_signalKey(string groupName, string signalType, string mainName, string comparisonName) =>
+    groupName + "|" + signalType + "|" + mainName + "|" + comparisonName + "|" + str.tostring(time[pivotLen])
+
+var string[] firedSignalKeys = array.new_string()
+
+f_rememberSignal(string key) =>
+    array.push(firedSignalKeys, key)
+    if array.size(firedSignalKeys) > 300
+        array.shift(firedSignalKeys)
+
+f_fireSignal(string groupName, string signalType, string mainSymbolId, string comparisonSymbolId, bool bullish, int previousPivotBar, float previousPivot, int currentPivotBar, float currentPivot, int currentPivotTime, string meaning) =>
+    string mainName = f_shortSymbol(mainSymbolId)
+    string comparisonName = f_shortSymbol(comparisonSymbolId)
+    string key = f_signalKey(groupName, signalType, mainName, comparisonName)
+    if not array.includes(firedSignalKeys, key) and inSessionAtPivot and barstate.isconfirmed
+        string direction = bullish ? "Bullish" : "Bearish"
+        string messageText = f_message(signalType, groupName, mainName, comparisonName, direction, meaning)
+        string json = f_alertJson(signalType, groupName, mainName, comparisonName, currentPivot, currentPivotTime, messageText)
+        if drawForeignSignals or mainSymbolId == syminfo.tickerid
+            f_drawSignal(bullish, signalType, mainName, comparisonName, previousPivotBar, previousPivot, currentPivotBar, currentPivot)
+        alert(json, alert.freq_all)
+        f_rememberSignal(key)
+
+// -----------------------------
+// Requested symbol data
+// -----------------------------
+eurHigh = request.security(eurSymbol, timeframe.period, high, barmerge.gaps_off, barmerge.lookahead_off)
+eurLow = request.security(eurSymbol, timeframe.period, low, barmerge.gaps_off, barmerge.lookahead_off)
+gbpHigh = request.security(gbpSymbol, timeframe.period, high, barmerge.gaps_off, barmerge.lookahead_off)
+gbpLow = request.security(gbpSymbol, timeframe.period, low, barmerge.gaps_off, barmerge.lookahead_off)
+chfHigh = request.security(chfSymbol, timeframe.period, high, barmerge.gaps_off, barmerge.lookahead_off)
+chfLow = request.security(chfSymbol, timeframe.period, low, barmerge.gaps_off, barmerge.lookahead_off)
+xauUsdHigh = request.security(xauUsdSymbol, timeframe.period, high, barmerge.gaps_off, barmerge.lookahead_off)
+xauUsdLow = request.security(xauUsdSymbol, timeframe.period, low, barmerge.gaps_off, barmerge.lookahead_off)
+xauEurHigh = request.security(xauEurSymbol, timeframe.period, high, barmerge.gaps_off, barmerge.lookahead_off)
+xauEurLow = request.security(xauEurSymbol, timeframe.period, low, barmerge.gaps_off, barmerge.lookahead_off)
+xauGbpHigh = request.security(xauGbpSymbol, timeframe.period, high, barmerge.gaps_off, barmerge.lookahead_off)
+xauGbpLow = request.security(xauGbpSymbol, timeframe.period, low, barmerge.gaps_off, barmerge.lookahead_off)
+
+// -----------------------------
+// Pivot state
+// -----------------------------
+eurPL = ta.pivotlow(eurLow, pivotLen, pivotLen)
+eurPH = ta.pivothigh(eurHigh, pivotLen, pivotLen)
+gbpPL = ta.pivotlow(gbpLow, pivotLen, pivotLen)
+gbpPH = ta.pivothigh(gbpHigh, pivotLen, pivotLen)
+chfPL = ta.pivotlow(chfLow, pivotLen, pivotLen)
+chfPH = ta.pivothigh(chfHigh, pivotLen, pivotLen)
+xauUsdPL = ta.pivotlow(xauUsdLow, pivotLen, pivotLen)
+xauUsdPH = ta.pivothigh(xauUsdHigh, pivotLen, pivotLen)
+xauEurPL = ta.pivotlow(xauEurLow, pivotLen, pivotLen)
+xauEurPH = ta.pivothigh(xauEurHigh, pivotLen, pivotLen)
+xauGbpPL = ta.pivotlow(xauGbpLow, pivotLen, pivotLen)
+xauGbpPH = ta.pivothigh(xauGbpHigh, pivotLen, pivotLen)
+
+eurPrevLow = ta.valuewhen(not na(eurPL), eurPL, 1)
+eurPrevHigh = ta.valuewhen(not na(eurPH), eurPH, 1)
+gbpPrevLow = ta.valuewhen(not na(gbpPL), gbpPL, 1)
+gbpPrevHigh = ta.valuewhen(not na(gbpPH), gbpPH, 1)
+chfPrevLow = ta.valuewhen(not na(chfPL), chfPL, 1)
+chfPrevHigh = ta.valuewhen(not na(chfPH), chfPH, 1)
+xauUsdPrevLow = ta.valuewhen(not na(xauUsdPL), xauUsdPL, 1)
+xauUsdPrevHigh = ta.valuewhen(not na(xauUsdPH), xauUsdPH, 1)
+xauEurPrevLow = ta.valuewhen(not na(xauEurPL), xauEurPL, 1)
+xauEurPrevHigh = ta.valuewhen(not na(xauEurPH), xauEurPH, 1)
+xauGbpPrevLow = ta.valuewhen(not na(xauGbpPL), xauGbpPL, 1)
+xauGbpPrevHigh = ta.valuewhen(not na(xauGbpPH), xauGbpPH, 1)
+
+currentPivotBar = bar_index[pivotLen]
+currentPivotTime = time[pivotLen]
+eurPrevLowBar = ta.valuewhen(not na(eurPL), bar_index[pivotLen], 1)
+eurPrevHighBar = ta.valuewhen(not na(eurPH), bar_index[pivotLen], 1)
+gbpPrevLowBar = ta.valuewhen(not na(gbpPL), bar_index[pivotLen], 1)
+gbpPrevHighBar = ta.valuewhen(not na(gbpPH), bar_index[pivotLen], 1)
+xauUsdPrevLowBar = ta.valuewhen(not na(xauUsdPL), bar_index[pivotLen], 1)
+xauUsdPrevHighBar = ta.valuewhen(not na(xauUsdPH), bar_index[pivotLen], 1)
+
+eurSweptLow = not na(eurPL) and not na(eurPrevLow) and eurPL < eurPrevLow
+eurSweptHigh = not na(eurPH) and not na(eurPrevHigh) and eurPH > eurPrevHigh
+gbpSweptLow = not na(gbpPL) and not na(gbpPrevLow) and gbpPL < gbpPrevLow
+gbpSweptHigh = not na(gbpPH) and not na(gbpPrevHigh) and gbpPH > gbpPrevHigh
+chfSweptLow = not na(chfPL) and not na(chfPrevLow) and chfPL < chfPrevLow
+chfSweptHigh = not na(chfPH) and not na(chfPrevHigh) and chfPH > chfPrevHigh
+xauUsdSweptLow = not na(xauUsdPL) and not na(xauUsdPrevLow) and xauUsdPL < xauUsdPrevLow
+xauUsdSweptHigh = not na(xauUsdPH) and not na(xauUsdPrevHigh) and xauUsdPH > xauUsdPrevHigh
+xauEurSweptLow = not na(xauEurPL) and not na(xauEurPrevLow) and xauEurPL < xauEurPrevLow
+xauEurSweptHigh = not na(xauEurPH) and not na(xauEurPrevHigh) and xauEurPH > xauEurPrevHigh
+xauGbpSweptLow = not na(xauGbpPL) and not na(xauGbpPrevLow) and xauGbpPL < xauGbpPrevLow
+xauGbpSweptHigh = not na(xauGbpPH) and not na(xauGbpPrevHigh) and xauGbpPH > xauGbpPrevHigh
+
+// Comparison confirmation is evaluated at the same confirmed pivot bar.
+gbpFailedLow = not gbpSweptLow
+gbpFailedHigh = not gbpSweptHigh
+eurFailedLow = not eurSweptLow
+eurFailedHigh = not eurSweptHigh
+chfFailedInverseHigh = not chfSweptHigh
+chfFailedInverseLow = not chfSweptLow
+xauEurFailedLow = not xauEurSweptLow
+xauEurFailedHigh = not xauEurSweptHigh
+xauGbpFailedLow = not xauGbpSweptLow
+xauGbpFailedHigh = not xauGbpSweptHigh
+
+// -----------------------------
+// SMT conditions and alerts
+// -----------------------------
+if showForexSignals
+    if eurSweptLow and gbpFailedLow
+        f_fireSignal("FOREX", "BULLISH_SMT", eurSymbol, gbpSymbol, true, eurPrevLowBar, eurPrevLow, currentPivotBar, eurPL, currentPivotTime, "EURUSD swept a lower low while GBPUSD failed to confirm.")
+    if gbpSweptLow and eurFailedLow
+        f_fireSignal("FOREX", "BULLISH_SMT", gbpSymbol, eurSymbol, true, gbpPrevLowBar, gbpPrevLow, currentPivotBar, gbpPL, currentPivotTime, "GBPUSD swept a lower low while EURUSD failed to confirm.")
+    if eurSweptHigh and gbpFailedHigh
+        f_fireSignal("FOREX", "BEARISH_SMT", eurSymbol, gbpSymbol, false, eurPrevHighBar, eurPrevHigh, currentPivotBar, eurPH, currentPivotTime, "EURUSD swept a higher high while GBPUSD failed to confirm.")
+    if gbpSweptHigh and eurFailedHigh
+        f_fireSignal("FOREX", "BEARISH_SMT", gbpSymbol, eurSymbol, false, gbpPrevHighBar, gbpPrevHigh, currentPivotBar, gbpPH, currentPivotTime, "GBPUSD swept a higher high while EURUSD failed to confirm.")
+
+    if eurSweptLow and chfFailedInverseHigh
+        f_fireSignal("FOREX", "BULLISH_SMT", eurSymbol, chfSymbol, true, eurPrevLowBar, eurPrevLow, currentPivotBar, eurPL, currentPivotTime, "EURUSD swept a lower low while USDCHF failed to confirm with a higher high.")
+    if gbpSweptLow and chfFailedInverseHigh
+        f_fireSignal("FOREX", "BULLISH_SMT", gbpSymbol, chfSymbol, true, gbpPrevLowBar, gbpPrevLow, currentPivotBar, gbpPL, currentPivotTime, "GBPUSD swept a lower low while USDCHF failed to confirm with a higher high.")
+    if eurSweptHigh and chfFailedInverseLow
+        f_fireSignal("FOREX", "BEARISH_SMT", eurSymbol, chfSymbol, false, eurPrevHighBar, eurPrevHigh, currentPivotBar, eurPH, currentPivotTime, "EURUSD swept a higher high while USDCHF failed to confirm with a lower low.")
+    if gbpSweptHigh and chfFailedInverseLow
+        f_fireSignal("FOREX", "BEARISH_SMT", gbpSymbol, chfSymbol, false, gbpPrevHighBar, gbpPrevHigh, currentPivotBar, gbpPH, currentPivotTime, "GBPUSD swept a higher high while USDCHF failed to confirm with a lower low.")
+
+if showGoldSignals
+    if xauUsdSweptLow and xauEurFailedLow
+        f_fireSignal("GOLD", "BULLISH_SMT", xauUsdSymbol, xauEurSymbol, true, xauUsdPrevLowBar, xauUsdPrevLow, currentPivotBar, xauUsdPL, currentPivotTime, "XAUUSD swept a lower low while XAUEUR failed to confirm.")
+    if xauUsdSweptLow and xauGbpFailedLow
+        f_fireSignal("GOLD", "BULLISH_SMT", xauUsdSymbol, xauGbpSymbol, true, xauUsdPrevLowBar, xauUsdPrevLow, currentPivotBar, xauUsdPL, currentPivotTime, "XAUUSD swept a lower low while XAUGBP failed to confirm.")
+    if xauUsdSweptHigh and xauEurFailedHigh
+        f_fireSignal("GOLD", "BEARISH_SMT", xauUsdSymbol, xauEurSymbol, false, xauUsdPrevHighBar, xauUsdPrevHigh, currentPivotBar, xauUsdPH, currentPivotTime, "XAUUSD swept a higher high while XAUEUR failed to confirm.")
+    if xauUsdSweptHigh and xauGbpFailedHigh
+        f_fireSignal("GOLD", "BEARISH_SMT", xauUsdSymbol, xauGbpSymbol, false, xauUsdPrevHighBar, xauUsdPrevHigh, currentPivotBar, xauUsdPH, currentPivotTime, "XAUUSD swept a higher high while XAUGBP failed to confirm.")
+
+// Invisible plots make broad alert-condition selection easier if you want it,
+// while alert() carries the full JSON payload.
+plotchar(false, "SMT alert payload is sent via alert()", "", location.top, display=display.none)

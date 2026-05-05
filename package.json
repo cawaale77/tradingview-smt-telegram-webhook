@@ -1,0 +1,12 @@
+{
+  "name": "tradingview-smt-telegram-webhook",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Vercel serverless webhook receiver for TradingView SMT alerts forwarded to Telegram.",
+  "scripts": {
+    "dev": "vercel dev"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
