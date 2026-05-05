@@ -8,6 +8,7 @@ It only sends Telegram notifications. It does not execute trades.
 
 ```text
 POST /api/tradingview-alert
+GET /api/tradingview-alert
 ```
 
 After deployment, your TradingView webhook URL will be:
@@ -27,6 +28,16 @@ WEBHOOK_SECRET=your_shared_tradingview_secret
 ```
 
 The `secret` field sent by TradingView must match `WEBHOOK_SECRET`.
+
+## Health Check
+
+Open the endpoint in a browser:
+
+```text
+https://tradingview-smt-telegram-webhook-1s7c00q8z.vercel.app/api/tradingview-alert
+```
+
+It returns whether the required environment variables exist without exposing any secret values.
 
 ## Create a Telegram Bot
 
@@ -120,10 +131,10 @@ https://YOUR-VERCEL-DOMAIN.vercel.app/api/tradingview-alert
 ## Sample Curl Test
 
 ```bash
-curl -X POST https://YOUR-VERCEL-DOMAIN.vercel.app/api/tradingview-alert \
+curl -X POST https://tradingview-smt-telegram-webhook-1s7c00q8z.vercel.app/api/tradingview-alert \
   -H "Content-Type: application/json" \
   -d '{
-    "secret": "CHANGE_ME",
+    "secret": "smt-test-123",
     "signal_type": "BULLISH_SMT",
     "group": "FOREX",
     "main_symbol": "EURUSD",
@@ -153,6 +164,13 @@ If you send the same `signal_type + group + main_symbol + comparison_symbol + ti
   "duplicate": true
 }
 ```
+
+## Troubleshooting
+
+- `401 Unauthorized`: the alert secret does not match `WEBHOOK_SECRET`, or an old TradingView alert is still sending `"secret":"CHANGE_ME"`. Update the indicator input and recreate or update any old alerts.
+- `Webhook delivery failed - couldn't find this domain`: an old alert is still using the wrong webhook URL. Update it to `https://tradingview-smt-telegram-webhook-1s7c00q8z.vercel.app/api/tradingview-alert`.
+- `500` or `502` Telegram error: check `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and whether the bot can post to the group or channel.
+- Environment variables changed but behavior did not change: redeploy the Vercel project after changing env vars.
 
 ## Telegram Message Format
 

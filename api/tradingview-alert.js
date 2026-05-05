@@ -26,6 +26,29 @@ function normalizeString(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function hasValue(value) {
+  return normalizeString(value) !== "";
+}
+
+function createHealthPayload() {
+  return {
+    ok: true,
+    service: "tradingview-smt-telegram-webhook",
+    hasTelegramBotToken: hasValue(process.env.TELEGRAM_BOT_TOKEN),
+    hasTelegramChatId: hasValue(process.env.TELEGRAM_CHAT_ID),
+    hasWebhookSecret: hasValue(process.env.WEBHOOK_SECRET),
+  };
+}
+
+function logUnauthorizedSecret(receivedSecret, expectedSecret) {
+  console.warn("Webhook secret validation failed", {
+    receivedSecretLength: receivedSecret.length,
+    expectedSecretLength: expectedSecret.length,
+    hasReceivedSecret: receivedSecret !== "",
+    hasExpectedWebhookSecret: expectedSecret !== "",
+  });
+}
+
 function getMissingFields(body) {
   const requiredFields = [
     "secret",
@@ -119,15 +142,19 @@ async function sendTelegramMessage(text) {
 }
 
 module.exports = async function handler(req, res) {
+  if (req.method === "GET") {
+    return sendJson(res, 200, createHealthPayload());
+  }
+
   if (req.method !== "POST") {
-    res.setHeader("Allow", "POST");
+    res.setHeader("Allow", "GET, POST");
     return sendJson(res, 405, {
       success: false,
       error: "Method Not Allowed",
     });
   }
 
-  const webhookSecret = process.env.WEBHOOK_SECRET;
+  const webhookSecret = normalizeString(process.env.WEBHOOK_SECRET);
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
 
@@ -176,9 +203,12 @@ module.exports = async function handler(req, res) {
   };
 
   if (body.secret !== webhookSecret) {
+    logUnauthorizedSecret(body.secret, webhookSecret);
+
     return sendJson(res, 401, {
       success: false,
       error: "Unauthorized",
+      hint: "Check TradingView indicator Webhook secret and Vercel WEBHOOK_SECRET",
     });
   }
 
