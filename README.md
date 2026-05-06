@@ -131,7 +131,7 @@ https://YOUR-VERCEL-DOMAIN.vercel.app/api/tradingview-alert
 ## Sample Curl Test
 
 ```bash
-curl -X POST https://tradingview-smt-telegram-webhook-1s7c00q8z.vercel.app/api/tradingview-alert \
+curl -X POST https://tradingview-smt-telegram-webhook.vercel.app/api/tradingview-alert \
   -H "Content-Type: application/json" \
   -d '{
     "secret": "smt-test-123",
@@ -143,6 +143,26 @@ curl -X POST https://tradingview-smt-telegram-webhook-1s7c00q8z.vercel.app/api/t
     "price": "1.17063",
     "timestamp": "2026-05-05T10:30:00Z",
     "message": "Bullish SMT detected"
+  }'
+```
+
+## Sample TradingView Payload Test
+
+This matches the JSON shape sent by the Pine Script `alert()` payload:
+
+```bash
+curl -X POST https://tradingview-smt-telegram-webhook.vercel.app/api/tradingview-alert \
+  -H "Content-Type: application/json" \
+  -d '{
+    "secret": "smt-test-123",
+    "signal_type": "BEARISH_SMT",
+    "group": "GOLD",
+    "main_symbol": "XAUUSD",
+    "comparison_symbol": "XAUEUR",
+    "timeframe": "30",
+    "price": "3473.140",
+    "timestamp": "1778063400000",
+    "message": "BEARISH_SMT DETECTED\nGroup: GOLD\nMain: XAUUSD\nComparison: XAUEUR\nTimeframe: 30\nSession: HTF SMT\nDirection: Bearish\nMeaning: XAUUSD swept a higher high while XAUEUR failed to confirm.\nAction: Wait for entry model confirmation."
   }'
 ```
 
