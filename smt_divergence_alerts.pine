@@ -1,5 +1,5 @@
 //@version=5
-indicator("SMT Divergence Alerts - Forex & Gold", "SMT Alerts", overlay=true, max_lines_count=500, max_labels_count=500)
+indicator("SMT Divergence Alerts - Forex & Gold", "SMT Alerts", overlay=true, max_lines_count=500, max_labels_count=500, max_bars_back=1200)
 
 // This indicator is an alert/reminder tool only. It does not place trades.
 
@@ -18,11 +18,19 @@ xauGbpSymbol = input.symbol("OANDA:XAUGBP", "XAUGBP", group=goldGroup)
 
 settingsGroup = "SMT Settings"
 pivotLen = input.int(3, "Pivot length", minval=1, maxval=20, group=settingsGroup)
-sessionInput = input.session("0700-1700", "Session filter", group=settingsGroup)
-sessionTimezone = input.string("Etc/UTC", "Session timezone", group=settingsGroup, tooltip="Use an IANA timezone such as Etc/UTC, Europe/London, America/New_York, or Africa/Nairobi.")
+ltfLondonSession = input.session("0130-0500", "LTF London SMT Session", group=settingsGroup)
+ltfNewYorkSession = input.session("0730-1130", "LTF New York SMT Session", group=settingsGroup)
+htfSession = input.session("0000-2359", "HTF SMT Session", group=settingsGroup)
+sessionTimezone = input.string("America/New_York", "Session timezone", group=settingsGroup, tooltip="Use an IANA timezone such as America/New_York, Etc/UTC, Europe/London, or Africa/Nairobi.")
+goldAsianSession = input.session("1800-0000", "Gold Asian SMT Session", group=settingsGroup)
+goldAsianTimezone = input.string("Etc/UTC", "Gold Asian Session Timezone", group=settingsGroup, tooltip="Use an IANA timezone such as Etc/UTC, America/New_York, Europe/London, or Africa/Nairobi.")
+ltfMaxTimeframeMinutes = input.int(44, "LTF max timeframe minutes", minval=1, maxval=1440, group=settingsGroup)
 secretInput = input.string("CHANGE_ME", "Webhook secret", group=settingsGroup)
 showForexSignals = input.bool(true, "Show Forex SMT", group=settingsGroup)
 showGoldSignals = input.bool(true, "Show Gold SMT", group=settingsGroup)
+enableHtfOldPivotSmt = input.bool(true, "Enable HTF Old Pivot SMT", group=settingsGroup)
+htfOldPivotLookbackDays = input.int(7, "HTF Old Pivot Lookback Days", minval=1, maxval=30, group=settingsGroup)
+htfOldPivotStrength = input.int(3, "HTF Old Pivot Strength", minval=1, maxval=10, group=settingsGroup)
 
 visualGroup = "Visuals"
 bullColor = input.color(color.new(color.lime, 0), "Bullish SMT color", group=visualGroup)
@@ -34,9 +42,26 @@ drawForeignSignals = input.bool(false, "Draw non-chart symbol signals", group=vi
 // -----------------------------
 // Helpers
 // -----------------------------
-inSession = not na(time(timeframe.period, sessionInput, sessionTimezone))
-inSessionAtPivot = inSession[pivotLen]
 tfText = timeframe.period
+OLD_PIVOT_MAX_SCAN_BARS = 1000
+chartTimeframeSeconds = timeframe.in_seconds(timeframe.period)
+isLtfTimeframe = not na(chartTimeframeSeconds) and chartTimeframeSeconds <= ltfMaxTimeframeMinutes * 60
+inLtfLondonSession = not na(time(timeframe.period, ltfLondonSession, sessionTimezone))
+inLtfNewYorkSession = not na(time(timeframe.period, ltfNewYorkSession, sessionTimezone))
+inHtfSession = not na(time(timeframe.period, htfSession, sessionTimezone))
+inGoldAsianSession = not na(time(timeframe.period, goldAsianSession, goldAsianTimezone))
+inLtfLondonSessionAtPivot = inLtfLondonSession[pivotLen]
+inLtfNewYorkSessionAtPivot = inLtfNewYorkSession[pivotLen]
+inHtfSessionAtPivot = inHtfSession[pivotLen]
+inGoldAsianSessionAtPivot = inGoldAsianSession[pivotLen]
+
+f_inSessionAtPivot(string groupName) =>
+    bool commonLtfSession = inLtfLondonSessionAtPivot or inLtfNewYorkSessionAtPivot
+    bool goldLtfSession = commonLtfSession or (groupName == "GOLD" and inGoldAsianSessionAtPivot)
+    isLtfTimeframe ? (groupName == "GOLD" ? goldLtfSession : commonLtfSession) : inHtfSessionAtPivot
+
+f_sessionNameAtPivot(string groupName) =>
+    isLtfTimeframe ? (inLtfLondonSessionAtPivot ? "London SMT" : inLtfNewYorkSessionAtPivot ? "New York SMT" : groupName == "GOLD" and inGoldAsianSessionAtPivot ? "Gold Asian SMT" : "") : (inHtfSessionAtPivot ? "HTF SMT" : "")
 
 f_shortSymbol(string symbolId) =>
     string[] parts = str.split(symbolId, ":")
@@ -48,17 +73,55 @@ f_jsonEscape(string value) =>
     escaped := str.replace_all(escaped, "\n", "\\n")
     escaped
 
-f_message(string signalType, string groupName, string mainName, string comparisonName, string direction, string meaning) =>
+f_isBullishSignal(string signalType) =>
+    signalType == "BULLISH_SMT"
+
+f_isUsdChfInversePair(string mainName, string comparisonName) =>
+    mainName == "USDCHF" or comparisonName == "USDCHF"
+
+f_correlationMeaning(string signalType, string mainName, string comparisonName) =>
+    bool bullish = f_isBullishSignal(signalType)
+    bool mainIsUsdChf = mainName == "USDCHF"
+    bool comparisonIsUsdChf = comparisonName == "USDCHF"
+    string meaning = ""
+    if comparisonIsUsdChf and not mainIsUsdChf
+        meaning := bullish ? mainName + " swept a lower low, but USDCHF failed to sweep the opposite higher high." : mainName + " swept a higher high, but USDCHF failed to sweep the opposite lower low."
+    else if mainIsUsdChf
+        meaning := bullish ? "USDCHF swept a lower low, but " + comparisonName + " failed to sweep the opposite higher high." : "USDCHF swept a higher high, but " + comparisonName + " failed to sweep the opposite lower low."
+    else
+        meaning := bullish ? mainName + " swept a lower low, but " + comparisonName + " failed to sweep its corresponding lower low." : mainName + " swept a higher high, but " + comparisonName + " failed to sweep its corresponding higher high."
+    meaning
+
+f_correlationInterpretation(string signalType, string mainName, string comparisonName) =>
+    bool bullish = f_isBullishSignal(signalType)
+    bool mainIsUsdChf = mainName == "USDCHF"
+    bool comparisonIsUsdChf = comparisonName == "USDCHF"
+    string interpretation = ""
+    if comparisonIsUsdChf and not mainIsUsdChf
+        interpretation := bullish ? "This is bullish SMT for " + mainName + " because the inverse pair did not confirm the downside sweep." : "This is bearish SMT for " + mainName + " because the inverse pair did not confirm the upside sweep."
+    else if mainIsUsdChf
+        interpretation := bullish ? "This is bullish SMT for USDCHF because the inverse pair did not confirm USDCHF weakness." : "This is bearish SMT for USDCHF because the inverse pair did not confirm USDCHF strength."
+    else
+        interpretation := bullish ? "This is bullish SMT because two positively correlated instruments did not confirm the same downside move." : "This is bearish SMT because two positively correlated instruments did not confirm the same upside move."
+    interpretation
+
+f_message(string signalType, string groupName, string mainName, string comparisonName, string direction, string sessionName, string meaning) =>
     "🚨 " + signalType + " DETECTED\n" +
+      "\n" +
       "Group: " + groupName + "\n" +
       "Main: " + mainName + "\n" +
       "Comparison: " + comparisonName + "\n" +
       "Timeframe: " + tfText + "\n" +
-      "Direction: " + direction + "\n" +
-      "Meaning: " + meaning + "\n" +
-      "Action: Wait for entry model confirmation."
+      "Session: " + sessionName + "\n" +
+      "Direction: " + direction + "\n\n" +
+      "Meaning:\n" +
+      f_correlationMeaning(signalType, mainName, comparisonName) + "\n\n" +
+      "Interpretation:\n" +
+      f_correlationInterpretation(signalType, mainName, comparisonName) + "\n\n" +
+      "Action:\n" +
+      "Wait for entry model confirmation."
 
-f_alertJson(string signalType, string groupName, string mainName, string comparisonName, float priceValue, int timestampValue, string messageText) =>
+f_alertJson(string signalType, string groupName, string mainName, string comparisonName, float priceValue, int timestampValue, string sessionName, string messageText) =>
     "{" +
       "\"secret\":\"" + f_jsonEscape(secretInput) + "\"," +
       "\"signal_type\":\"" + signalType + "\"," +
@@ -68,6 +131,46 @@ f_alertJson(string signalType, string groupName, string mainName, string compari
       "\"timeframe\":\"" + tfText + "\"," +
       "\"price\":\"" + str.tostring(priceValue, format.mintick) + "\"," +
       "\"timestamp\":\"" + str.tostring(timestampValue) + "\"," +
+      "\"session_name\":\"" + f_jsonEscape(sessionName) + "\"," +
+      "\"message\":\"" + f_jsonEscape(messageText) + "\"" +
+      "}"
+
+f_oldPivotMessage(string signalType, string oldPivotType, string groupName, string mainName, string comparisonName, string direction, string sessionName, float priceValue, int oldPivotTime, float oldPivotPrice, string meaning) =>
+    "🚨 HTF Old Pivot SMT\n" +
+      oldPivotType + "\n" +
+      "Signal: " + signalType + "\n" +
+      "Group: " + groupName + "\n" +
+      "Main: " + mainName + "\n" +
+      "Comparison: " + comparisonName + "\n" +
+      "Timeframe: " + tfText + "\n" +
+      "Session: " + sessionName + "\n" +
+      "Lookback Days: " + str.tostring(htfOldPivotLookbackDays) + "\n" +
+      "Direction: " + direction + "\n" +
+      "Price: " + str.tostring(priceValue, format.mintick) + "\n" +
+      "Old Pivot Time: " + str.tostring(oldPivotTime) + "\n" +
+      "Old Pivot Price: " + str.tostring(oldPivotPrice, format.mintick) + "\n\n" +
+      "Meaning:\n" +
+      f_correlationMeaning(signalType, mainName, comparisonName) + "\n\n" +
+      "Interpretation:\n" +
+      f_correlationInterpretation(signalType, mainName, comparisonName) + "\n\n" +
+      "Action:\n" +
+      "Wait for entry model confirmation."
+
+f_alertJsonOldPivot(string signalType, string groupName, string mainName, string comparisonName, float priceValue, int timestampValue, string sessionName, string messageText, int oldPivotTime, float oldPivotPrice) =>
+    "{" +
+      "\"secret\":\"" + f_jsonEscape(secretInput) + "\"," +
+      "\"signal_type\":\"" + signalType + "\"," +
+      "\"group\":\"" + groupName + "\"," +
+      "\"main_symbol\":\"" + f_jsonEscape(mainName) + "\"," +
+      "\"comparison_symbol\":\"" + f_jsonEscape(comparisonName) + "\"," +
+      "\"timeframe\":\"" + tfText + "\"," +
+      "\"price\":\"" + str.tostring(priceValue, format.mintick) + "\"," +
+      "\"timestamp\":\"" + str.tostring(timestampValue) + "\"," +
+      "\"session_name\":\"" + f_jsonEscape(sessionName) + "\"," +
+      "\"smt_mode\":\"HTF_OLD_PIVOT_SMT\"," +
+      "\"lookback_days\":" + str.tostring(htfOldPivotLookbackDays) + "," +
+      "\"old_pivot_time\":\"" + str.tostring(oldPivotTime) + "\"," +
+      "\"old_pivot_price\":\"" + str.tostring(oldPivotPrice, format.mintick) + "\"," +
       "\"message\":\"" + f_jsonEscape(messageText) + "\"" +
       "}"
 
@@ -93,6 +196,63 @@ f_drawSignal(bool bullish, string signalType, string mainName, string comparison
 f_signalKey(string groupName, string signalType, string mainName, string comparisonName) =>
     groupName + "|" + signalType + "|" + mainName + "|" + comparisonName + "|" + str.tostring(time[pivotLen])
 
+f_oldSignalKey(string groupName, string signalType, string mainName, string comparisonName, int oldPivotTime, int sweepTime) =>
+    groupName + "|HTF_OLD_PIVOT_SMT|" + signalType + "|" + mainName + "|" + comparisonName + "|" + tfText + "|" + str.tostring(oldPivotTime) + "|" + str.tostring(sweepTime)
+
+f_findSweptOldHigh(float pivotHighSeries, float sweepHigh) =>
+    float foundPrice = na
+    int foundTime = na
+    int foundBar = na
+    int lookbackStartTime = time - htfOldPivotLookbackDays * 24 * 60 * 60 * 1000
+    if enableHtfOldPivotSmt and not isLtfTimeframe
+        for i = 1 to OLD_PIVOT_MAX_SCAN_BARS
+            int pivotOffset = i + htfOldPivotStrength
+            bool pivotIsInWindow = not na(time[pivotOffset]) and time[pivotOffset] >= lookbackStartTime
+            bool pivotWasSweptNow = not na(pivotHighSeries[i]) and sweepHigh > pivotHighSeries[i] and sweepHigh[1] <= pivotHighSeries[i]
+            if pivotIsInWindow and pivotWasSweptNow and (na(foundPrice) or pivotHighSeries[i] > foundPrice)
+                foundPrice := pivotHighSeries[i]
+                foundTime := time[pivotOffset]
+                foundBar := bar_index[pivotOffset]
+    [foundPrice, foundTime, foundBar]
+
+f_findSweptOldLow(float pivotLowSeries, float sweepLow) =>
+    float foundPrice = na
+    int foundTime = na
+    int foundBar = na
+    int lookbackStartTime = time - htfOldPivotLookbackDays * 24 * 60 * 60 * 1000
+    if enableHtfOldPivotSmt and not isLtfTimeframe
+        for i = 1 to OLD_PIVOT_MAX_SCAN_BARS
+            int pivotOffset = i + htfOldPivotStrength
+            bool pivotIsInWindow = not na(time[pivotOffset]) and time[pivotOffset] >= lookbackStartTime
+            bool pivotWasSweptNow = not na(pivotLowSeries[i]) and sweepLow < pivotLowSeries[i] and sweepLow[1] >= pivotLowSeries[i]
+            if pivotIsInWindow and pivotWasSweptNow and (na(foundPrice) or pivotLowSeries[i] < foundPrice)
+                foundPrice := pivotLowSeries[i]
+                foundTime := time[pivotOffset]
+                foundBar := bar_index[pivotOffset]
+    [foundPrice, foundTime, foundBar]
+
+f_findRelevantOldHigh(float pivotHighSeries) =>
+    float foundPrice = na
+    int lookbackStartTime = time - htfOldPivotLookbackDays * 24 * 60 * 60 * 1000
+    if enableHtfOldPivotSmt and not isLtfTimeframe
+        for i = 1 to OLD_PIVOT_MAX_SCAN_BARS
+            int pivotOffset = i + htfOldPivotStrength
+            bool pivotIsInWindow = not na(time[pivotOffset]) and time[pivotOffset] >= lookbackStartTime
+            if pivotIsInWindow and not na(pivotHighSeries[i]) and (na(foundPrice) or pivotHighSeries[i] > foundPrice)
+                foundPrice := pivotHighSeries[i]
+    foundPrice
+
+f_findRelevantOldLow(float pivotLowSeries) =>
+    float foundPrice = na
+    int lookbackStartTime = time - htfOldPivotLookbackDays * 24 * 60 * 60 * 1000
+    if enableHtfOldPivotSmt and not isLtfTimeframe
+        for i = 1 to OLD_PIVOT_MAX_SCAN_BARS
+            int pivotOffset = i + htfOldPivotStrength
+            bool pivotIsInWindow = not na(time[pivotOffset]) and time[pivotOffset] >= lookbackStartTime
+            if pivotIsInWindow and not na(pivotLowSeries[i]) and (na(foundPrice) or pivotLowSeries[i] < foundPrice)
+                foundPrice := pivotLowSeries[i]
+    foundPrice
+
 var string[] firedSignalKeys = array.new_string()
 
 f_rememberSignal(string key) =>
@@ -104,12 +264,25 @@ f_fireSignal(string groupName, string signalType, string mainSymbolId, string co
     string mainName = f_shortSymbol(mainSymbolId)
     string comparisonName = f_shortSymbol(comparisonSymbolId)
     string key = f_signalKey(groupName, signalType, mainName, comparisonName)
-    if not array.includes(firedSignalKeys, key) and inSessionAtPivot and barstate.isconfirmed
+    string sessionName = f_sessionNameAtPivot(groupName)
+    if not array.includes(firedSignalKeys, key) and f_inSessionAtPivot(groupName) and barstate.isconfirmed
         string direction = bullish ? "Bullish" : "Bearish"
-        string messageText = f_message(signalType, groupName, mainName, comparisonName, direction, meaning)
-        string json = f_alertJson(signalType, groupName, mainName, comparisonName, currentPivot, currentPivotTime, messageText)
+        string messageText = f_message(signalType, groupName, mainName, comparisonName, direction, sessionName, meaning)
+        string json = f_alertJson(signalType, groupName, mainName, comparisonName, currentPivot, currentPivotTime, sessionName, messageText)
         if drawForeignSignals or mainSymbolId == syminfo.tickerid
             f_drawSignal(bullish, signalType, mainName, comparisonName, previousPivotBar, previousPivot, currentPivotBar, currentPivot)
+        alert(json, alert.freq_all)
+        f_rememberSignal(key)
+
+f_fireOldPivotSignal(string groupName, string signalType, string oldPivotType, string mainSymbolId, string comparisonSymbolId, bool bullish, float sweepPrice, int oldPivotTime, float oldPivotPrice, string meaning) =>
+    string mainName = f_shortSymbol(mainSymbolId)
+    string comparisonName = f_shortSymbol(comparisonSymbolId)
+    string key = f_oldSignalKey(groupName, signalType, mainName, comparisonName, oldPivotTime, time)
+    string sessionName = inHtfSession ? "HTF SMT" : ""
+    if enableHtfOldPivotSmt and not isLtfTimeframe and inHtfSession and barstate.isconfirmed and not na(oldPivotTime) and not array.includes(firedSignalKeys, key)
+        string direction = bullish ? "Bullish" : "Bearish"
+        string messageText = f_oldPivotMessage(signalType, oldPivotType, groupName, mainName, comparisonName, direction, sessionName, sweepPrice, oldPivotTime, oldPivotPrice, meaning)
+        string json = f_alertJsonOldPivot(signalType, groupName, mainName, comparisonName, sweepPrice, time, sessionName, messageText, oldPivotTime, oldPivotPrice)
         alert(json, alert.freq_all)
         f_rememberSignal(key)
 
@@ -145,6 +318,19 @@ xauEurPH = ta.pivothigh(xauEurHigh, pivotLen, pivotLen)
 xauGbpPL = ta.pivotlow(xauGbpLow, pivotLen, pivotLen)
 xauGbpPH = ta.pivothigh(xauGbpHigh, pivotLen, pivotLen)
 
+eurOldPL = ta.pivotlow(eurLow, htfOldPivotStrength, htfOldPivotStrength)
+eurOldPH = ta.pivothigh(eurHigh, htfOldPivotStrength, htfOldPivotStrength)
+gbpOldPL = ta.pivotlow(gbpLow, htfOldPivotStrength, htfOldPivotStrength)
+gbpOldPH = ta.pivothigh(gbpHigh, htfOldPivotStrength, htfOldPivotStrength)
+chfOldPL = ta.pivotlow(chfLow, htfOldPivotStrength, htfOldPivotStrength)
+chfOldPH = ta.pivothigh(chfHigh, htfOldPivotStrength, htfOldPivotStrength)
+xauUsdOldPL = ta.pivotlow(xauUsdLow, htfOldPivotStrength, htfOldPivotStrength)
+xauUsdOldPH = ta.pivothigh(xauUsdHigh, htfOldPivotStrength, htfOldPivotStrength)
+xauEurOldPL = ta.pivotlow(xauEurLow, htfOldPivotStrength, htfOldPivotStrength)
+xauEurOldPH = ta.pivothigh(xauEurHigh, htfOldPivotStrength, htfOldPivotStrength)
+xauGbpOldPL = ta.pivotlow(xauGbpLow, htfOldPivotStrength, htfOldPivotStrength)
+xauGbpOldPH = ta.pivothigh(xauGbpHigh, htfOldPivotStrength, htfOldPivotStrength)
+
 eurPrevLow = ta.valuewhen(not na(eurPL), eurPL, 1)
 eurPrevHigh = ta.valuewhen(not na(eurPH), eurPH, 1)
 gbpPrevLow = ta.valuewhen(not na(gbpPL), gbpPL, 1)
@@ -173,6 +359,8 @@ gbpSweptLow = not na(gbpPL) and not na(gbpPrevLow) and gbpPL < gbpPrevLow
 gbpSweptHigh = not na(gbpPH) and not na(gbpPrevHigh) and gbpPH > gbpPrevHigh
 chfSweptLow = not na(chfPL) and not na(chfPrevLow) and chfPL < chfPrevLow
 chfSweptHigh = not na(chfPH) and not na(chfPrevHigh) and chfPH > chfPrevHigh
+chfConfirmedInverseHighAtPivot = not na(chfPrevHigh) and chfHigh[pivotLen] > chfPrevHigh
+chfConfirmedInverseLowAtPivot = not na(chfPrevLow) and chfLow[pivotLen] < chfPrevLow
 xauUsdSweptLow = not na(xauUsdPL) and not na(xauUsdPrevLow) and xauUsdPL < xauUsdPrevLow
 xauUsdSweptHigh = not na(xauUsdPH) and not na(xauUsdPrevHigh) and xauUsdPH > xauUsdPrevHigh
 xauEurSweptLow = not na(xauEurPL) and not na(xauEurPrevLow) and xauEurPL < xauEurPrevLow
@@ -185,12 +373,41 @@ gbpFailedLow = not gbpSweptLow
 gbpFailedHigh = not gbpSweptHigh
 eurFailedLow = not eurSweptLow
 eurFailedHigh = not eurSweptHigh
-chfFailedInverseHigh = not chfSweptHigh
-chfFailedInverseLow = not chfSweptLow
+chfFailedInverseHigh = not chfConfirmedInverseHighAtPivot
+chfFailedInverseLow = not chfConfirmedInverseLowAtPivot
 xauEurFailedLow = not xauEurSweptLow
 xauEurFailedHigh = not xauEurSweptHigh
 xauGbpFailedLow = not xauGbpSweptLow
 xauGbpFailedHigh = not xauGbpSweptHigh
+
+[eurSweptOldHighPrice, eurSweptOldHighTime, eurSweptOldHighBar] = f_findSweptOldHigh(eurOldPH, eurHigh)
+[eurSweptOldLowPrice, eurSweptOldLowTime, eurSweptOldLowBar] = f_findSweptOldLow(eurOldPL, eurLow)
+[gbpSweptOldHighPrice, gbpSweptOldHighTime, gbpSweptOldHighBar] = f_findSweptOldHigh(gbpOldPH, gbpHigh)
+[gbpSweptOldLowPrice, gbpSweptOldLowTime, gbpSweptOldLowBar] = f_findSweptOldLow(gbpOldPL, gbpLow)
+[xauUsdSweptOldHighPrice, xauUsdSweptOldHighTime, xauUsdSweptOldHighBar] = f_findSweptOldHigh(xauUsdOldPH, xauUsdHigh)
+[xauUsdSweptOldLowPrice, xauUsdSweptOldLowTime, xauUsdSweptOldLowBar] = f_findSweptOldLow(xauUsdOldPL, xauUsdLow)
+
+eurRelevantOldHigh = f_findRelevantOldHigh(eurOldPH)
+eurRelevantOldLow = f_findRelevantOldLow(eurOldPL)
+gbpRelevantOldHigh = f_findRelevantOldHigh(gbpOldPH)
+gbpRelevantOldLow = f_findRelevantOldLow(gbpOldPL)
+chfRelevantOldHigh = f_findRelevantOldHigh(chfOldPH)
+chfRelevantOldLow = f_findRelevantOldLow(chfOldPL)
+xauEurRelevantOldHigh = f_findRelevantOldHigh(xauEurOldPH)
+xauEurRelevantOldLow = f_findRelevantOldLow(xauEurOldPL)
+xauGbpRelevantOldHigh = f_findRelevantOldHigh(xauGbpOldPH)
+xauGbpRelevantOldLow = f_findRelevantOldLow(xauGbpOldPL)
+
+gbpFailedOldHigh = not na(gbpRelevantOldHigh) and gbpHigh <= gbpRelevantOldHigh
+gbpFailedOldLow = not na(gbpRelevantOldLow) and gbpLow >= gbpRelevantOldLow
+eurFailedOldHigh = not na(eurRelevantOldHigh) and eurHigh <= eurRelevantOldHigh
+eurFailedOldLow = not na(eurRelevantOldLow) and eurLow >= eurRelevantOldLow
+chfFailedOldInverseHigh = not na(chfRelevantOldHigh) and chfHigh <= chfRelevantOldHigh
+chfFailedOldInverseLow = not na(chfRelevantOldLow) and chfLow >= chfRelevantOldLow
+xauEurFailedOldHigh = not na(xauEurRelevantOldHigh) and xauEurHigh <= xauEurRelevantOldHigh
+xauEurFailedOldLow = not na(xauEurRelevantOldLow) and xauEurLow >= xauEurRelevantOldLow
+xauGbpFailedOldHigh = not na(xauGbpRelevantOldHigh) and xauGbpHigh <= xauGbpRelevantOldHigh
+xauGbpFailedOldLow = not na(xauGbpRelevantOldLow) and xauGbpLow >= xauGbpRelevantOldLow
 
 // -----------------------------
 // SMT conditions and alerts
@@ -206,13 +423,13 @@ if showForexSignals
         f_fireSignal("FOREX", "BEARISH_SMT", gbpSymbol, eurSymbol, false, gbpPrevHighBar, gbpPrevHigh, currentPivotBar, gbpPH, currentPivotTime, "GBPUSD swept a higher high while EURUSD failed to confirm.")
 
     if eurSweptLow and chfFailedInverseHigh
-        f_fireSignal("FOREX", "BULLISH_SMT", eurSymbol, chfSymbol, true, eurPrevLowBar, eurPrevLow, currentPivotBar, eurPL, currentPivotTime, "EURUSD swept a lower low while USDCHF failed to confirm with a higher high.")
+        f_fireSignal("FOREX", "BULLISH_SMT", eurSymbol, chfSymbol, true, eurPrevLowBar, eurPrevLow, currentPivotBar, eurPL, currentPivotTime, "USDCHF failed to confirm EURUSD bullish SMT with a higher high. EURUSD swept a lower low.")
     if gbpSweptLow and chfFailedInverseHigh
-        f_fireSignal("FOREX", "BULLISH_SMT", gbpSymbol, chfSymbol, true, gbpPrevLowBar, gbpPrevLow, currentPivotBar, gbpPL, currentPivotTime, "GBPUSD swept a lower low while USDCHF failed to confirm with a higher high.")
+        f_fireSignal("FOREX", "BULLISH_SMT", gbpSymbol, chfSymbol, true, gbpPrevLowBar, gbpPrevLow, currentPivotBar, gbpPL, currentPivotTime, "USDCHF failed to confirm GBPUSD bullish SMT with a higher high. GBPUSD swept a lower low.")
     if eurSweptHigh and chfFailedInverseLow
-        f_fireSignal("FOREX", "BEARISH_SMT", eurSymbol, chfSymbol, false, eurPrevHighBar, eurPrevHigh, currentPivotBar, eurPH, currentPivotTime, "EURUSD swept a higher high while USDCHF failed to confirm with a lower low.")
+        f_fireSignal("FOREX", "BEARISH_SMT", eurSymbol, chfSymbol, false, eurPrevHighBar, eurPrevHigh, currentPivotBar, eurPH, currentPivotTime, "USDCHF failed to confirm EURUSD bearish SMT with a lower low. EURUSD swept a higher high.")
     if gbpSweptHigh and chfFailedInverseLow
-        f_fireSignal("FOREX", "BEARISH_SMT", gbpSymbol, chfSymbol, false, gbpPrevHighBar, gbpPrevHigh, currentPivotBar, gbpPH, currentPivotTime, "GBPUSD swept a higher high while USDCHF failed to confirm with a lower low.")
+        f_fireSignal("FOREX", "BEARISH_SMT", gbpSymbol, chfSymbol, false, gbpPrevHighBar, gbpPrevHigh, currentPivotBar, gbpPH, currentPivotTime, "USDCHF failed to confirm GBPUSD bearish SMT with a lower low. GBPUSD swept a higher high.")
 
 if showGoldSignals
     if xauUsdSweptLow and xauEurFailedLow
@@ -223,6 +440,39 @@ if showGoldSignals
         f_fireSignal("GOLD", "BEARISH_SMT", xauUsdSymbol, xauEurSymbol, false, xauUsdPrevHighBar, xauUsdPrevHigh, currentPivotBar, xauUsdPH, currentPivotTime, "XAUUSD swept a higher high while XAUEUR failed to confirm.")
     if xauUsdSweptHigh and xauGbpFailedHigh
         f_fireSignal("GOLD", "BEARISH_SMT", xauUsdSymbol, xauGbpSymbol, false, xauUsdPrevHighBar, xauUsdPrevHigh, currentPivotBar, xauUsdPH, currentPivotTime, "XAUUSD swept a higher high while XAUGBP failed to confirm.")
+
+// -----------------------------
+// Optional HTF Old Pivot SMT alerts
+// -----------------------------
+if enableHtfOldPivotSmt and not isLtfTimeframe
+    if showForexSignals
+        if not na(eurSweptOldLowPrice) and gbpFailedOldLow
+            f_fireOldPivotSignal("FOREX", "BULLISH_SMT", "Old Low SMT", eurSymbol, gbpSymbol, true, eurLow, eurSweptOldLowTime, eurSweptOldLowPrice, "EURUSD swept an old low from the lookback window while GBPUSD failed to confirm.")
+        if not na(gbpSweptOldLowPrice) and eurFailedOldLow
+            f_fireOldPivotSignal("FOREX", "BULLISH_SMT", "Old Low SMT", gbpSymbol, eurSymbol, true, gbpLow, gbpSweptOldLowTime, gbpSweptOldLowPrice, "GBPUSD swept an old low from the lookback window while EURUSD failed to confirm.")
+        if not na(eurSweptOldHighPrice) and gbpFailedOldHigh
+            f_fireOldPivotSignal("FOREX", "BEARISH_SMT", "Old High SMT", eurSymbol, gbpSymbol, false, eurHigh, eurSweptOldHighTime, eurSweptOldHighPrice, "EURUSD swept an old high from the lookback window while GBPUSD failed to confirm.")
+        if not na(gbpSweptOldHighPrice) and eurFailedOldHigh
+            f_fireOldPivotSignal("FOREX", "BEARISH_SMT", "Old High SMT", gbpSymbol, eurSymbol, false, gbpHigh, gbpSweptOldHighTime, gbpSweptOldHighPrice, "GBPUSD swept an old high from the lookback window while EURUSD failed to confirm.")
+
+        if not na(eurSweptOldLowPrice) and chfFailedOldInverseHigh
+            f_fireOldPivotSignal("FOREX", "BULLISH_SMT", "Old Low SMT", eurSymbol, chfSymbol, true, eurLow, eurSweptOldLowTime, eurSweptOldLowPrice, "USDCHF failed to confirm EURUSD bullish old pivot SMT with an old high sweep. EURUSD swept an old low from the lookback window.")
+        if not na(gbpSweptOldLowPrice) and chfFailedOldInverseHigh
+            f_fireOldPivotSignal("FOREX", "BULLISH_SMT", "Old Low SMT", gbpSymbol, chfSymbol, true, gbpLow, gbpSweptOldLowTime, gbpSweptOldLowPrice, "USDCHF failed to confirm GBPUSD bullish old pivot SMT with an old high sweep. GBPUSD swept an old low from the lookback window.")
+        if not na(eurSweptOldHighPrice) and chfFailedOldInverseLow
+            f_fireOldPivotSignal("FOREX", "BEARISH_SMT", "Old High SMT", eurSymbol, chfSymbol, false, eurHigh, eurSweptOldHighTime, eurSweptOldHighPrice, "USDCHF failed to confirm EURUSD bearish old pivot SMT with an old low sweep. EURUSD swept an old high from the lookback window.")
+        if not na(gbpSweptOldHighPrice) and chfFailedOldInverseLow
+            f_fireOldPivotSignal("FOREX", "BEARISH_SMT", "Old High SMT", gbpSymbol, chfSymbol, false, gbpHigh, gbpSweptOldHighTime, gbpSweptOldHighPrice, "USDCHF failed to confirm GBPUSD bearish old pivot SMT with an old low sweep. GBPUSD swept an old high from the lookback window.")
+
+    if showGoldSignals
+        if not na(xauUsdSweptOldLowPrice) and xauEurFailedOldLow
+            f_fireOldPivotSignal("GOLD", "BULLISH_SMT", "Old Low SMT", xauUsdSymbol, xauEurSymbol, true, xauUsdLow, xauUsdSweptOldLowTime, xauUsdSweptOldLowPrice, "XAUUSD swept an old low from the lookback window while XAUEUR failed to confirm.")
+        if not na(xauUsdSweptOldLowPrice) and xauGbpFailedOldLow
+            f_fireOldPivotSignal("GOLD", "BULLISH_SMT", "Old Low SMT", xauUsdSymbol, xauGbpSymbol, true, xauUsdLow, xauUsdSweptOldLowTime, xauUsdSweptOldLowPrice, "XAUUSD swept an old low from the lookback window while XAUGBP failed to confirm.")
+        if not na(xauUsdSweptOldHighPrice) and xauEurFailedOldHigh
+            f_fireOldPivotSignal("GOLD", "BEARISH_SMT", "Old High SMT", xauUsdSymbol, xauEurSymbol, false, xauUsdHigh, xauUsdSweptOldHighTime, xauUsdSweptOldHighPrice, "XAUUSD swept an old high from the lookback window while XAUEUR failed to confirm.")
+        if not na(xauUsdSweptOldHighPrice) and xauGbpFailedOldHigh
+            f_fireOldPivotSignal("GOLD", "BEARISH_SMT", "Old High SMT", xauUsdSymbol, xauGbpSymbol, false, xauUsdHigh, xauUsdSweptOldHighTime, xauUsdSweptOldHighPrice, "XAUUSD swept an old high from the lookback window while XAUGBP failed to confirm.")
 
 // Invisible plots make broad alert-condition selection easier if you want it,
 // while alert() carries the full JSON payload.
